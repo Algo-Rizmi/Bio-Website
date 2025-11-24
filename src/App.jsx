@@ -745,7 +745,14 @@ export default function App() {
                     isNight={isNight}
                     icon={<Coffee />}
                     title="Backend"
-                    skills={["Node.js", "C# .NET", "Python", "Java", "C"]}
+                    skills={[
+                      "Node.js",
+                      "C# .NET",
+                      "Python",
+                      "Java",
+                      "C",
+                      "MySQL",
+                    ]}
                   />
                   <SkillCard
                     onScan={handleSkillScan}
@@ -757,6 +764,8 @@ export default function App() {
                       "Docker",
                       "Kali Linux",
                       "Visual Studio",
+                      "MySQLWorkbench",
+                      "MongoDB",
                       "VirtualBox",
                       "VMware",
                     ]}
