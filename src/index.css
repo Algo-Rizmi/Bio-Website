@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Since we removed App.css, we can handle global defaults here.
+   The rest of the styling is handled by Tailwind classes in App.jsx 
+*/
+body {
+  margin: 0;
+  padding: 0;
+  background-color: #15803d; /* Fallback green */
+  overflow: hidden; /* Prevents scrollbars during animations */
+}
