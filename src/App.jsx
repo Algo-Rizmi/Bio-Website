@@ -24,16 +24,65 @@ import {
   Mountain,
   Coins,
   Wallet,
+  Activity,
+  Database,
+  Lock,
 } from "lucide-react";
+
+// --- FIREBASE IMPORTS ---
+import { initializeApp } from "firebase/app";
+import {
+  getAuth,
+  signInAnonymously,
+  onAuthStateChanged,
+  signInWithCustomToken,
+} from "firebase/auth";
+import {
+  getFirestore,
+  collection,
+  addDoc,
+  onSnapshot,
+  query,
+  orderBy,
+  serverTimestamp,
+} from "firebase/firestore";
 
 export default function App() {
   // --- CONFIGURATION ---
-  // !!! REPLACE THIS WITH YOUR ETHEREUM WALLET ADDRESS !!!
-  const MY_WALLET_ADDRESS = "0x7a2b7775a813ffd4569065442233801e7e13a8b0";
+  const MY_WALLET_ADDRESS = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F";
 
-  // Global Mode State: null = selector visible, 'RPG' or 'Normal' = mode chosen
+  // --- FIREBASE SETUP ---
+  const [user, setUser] = useState(null);
+  const [db, setDb] = useState(null);
+  const [appId, setAppId] = useState(null);
+  const hasLoggedVisit = useRef(false); // Prevent double logging in Strict Mode
+
+  useEffect(() => {
+    // 1. Initialize Firebase
+    const firebaseConfig = JSON.parse(__firebase_config);
+    const app = initializeApp(firebaseConfig);
+    const auth = getAuth(app);
+    const firestore = getFirestore(app);
+
+    setDb(firestore);
+    setAppId(typeof __app_id !== "undefined" ? __app_id : "default-app-id");
+
+    // 2. Authenticate
+    const initAuth = async () => {
+      if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
+        await signInWithCustomToken(auth, __initial_auth_token);
+      } else {
+        await signInAnonymously(auth);
+      }
+    };
+    initAuth();
+
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  // --- STATE ---
   const [appMode, setAppMode] = useState(null);
-
   const [currentView, setCurrentView] = useState("home");
   const [isNight, setIsNight] = useState(true);
   const [npcState, setNpcState] = useState({
@@ -43,8 +92,10 @@ export default function App() {
     facing: "front",
   });
   const [showModal, setShowModal] = useState(false);
+  const [visitorData, setVisitorData] = useState(null);
+  const [visitorLogs, setVisitorLogs] = useState([]); // Store fetched logs
 
-  // --- GEMINI API STATE ---
+  // Gemini & Chat
   const [chatInput, setChatInput] = useState("");
   const [chatHistory, setChatHistory] = useState([
     {
@@ -54,23 +105,248 @@ export default function App() {
   ]);
   const [isChatLoading, setIsChatLoading] = useState(false);
 
+  // Skills
   const [selectedSkill, setSelectedSkill] = useState(null);
   const [skillDescription, setSkillDescription] = useState("");
   const [isSkillLoading, setIsSkillLoading] = useState(false);
 
-  // --- TREASURY STATE ---
+  // Treasury
   const [donationAmount, setDonationAmount] = useState("0.01");
   const [isDonating, setIsDonating] = useState(false);
 
   const chatEndRef = useRef(null);
 
-  // Scroll to bottom of chat
+  // --- EFFECTS ---
+
+  // Scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory]);
 
-  // --- LOCATIONS ---
-  const locations = {
+  // Fetch Visitor IP & Log to Firebase
+  useEffect(() => {
+    const logVisitor = async () => {
+      if (!user || !db || hasLoggedVisit.current) return;
+
+      try {
+        const response = await fetch("https://ipapi.co/json/");
+        const data = await response.json();
+        setVisitorData(data);
+
+        // Log to Firebase
+        if (data.ip) {
+          hasLoggedVisit.current = true; // Mark as logged
+          await addDoc(
+            collection(
+              db,
+              "artifacts",
+              appId,
+              "public",
+              "data",
+              "visitor_logs"
+            ),
+            {
+              ip: data.ip,
+              city: data.city || "Unknown",
+              country: data.country_name || "Unknown",
+              isp: data.org || "Unknown",
+              timestamp: serverTimestamp(),
+              platform: navigator.platform,
+            }
+          );
+          console.log("Visitor logged securely.");
+        }
+      } catch (error) {
+        console.error("Tracking failed:", error);
+        setVisitorData({
+          ip: "UNKNOWN",
+          city: "HIDDEN",
+          country_name: "PROXY DETECTED",
+        });
+      }
+    };
+
+    logVisitor();
+  }, [user, db, appId]);
+
+  // Fetch Logs for Admin View
+  useEffect(() => {
+    if (!user || !db || currentView !== "logs") return;
+
+    // Real-time listener for logs
+    const q = query(
+      collection(db, "artifacts", appId, "public", "data", "visitor_logs")
+    );
+    const unsubscribe = onSnapshot(
+      q,
+      (snapshot) => {
+        const logs = snapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+        }));
+        // Sort in memory since simple queries are required
+        logs.sort(
+          (a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0)
+        );
+        setVisitorLogs(logs);
+      },
+      (error) => {
+        console.error("Error fetching logs:", error);
+      }
+    );
+
+    return () => unsubscribe();
+  }, [user, db, currentView, appId]);
+
+  // --- HELPERS ---
+  const callGemini = async (prompt, systemInstruction = "") => {
+    const apiKey = "";
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+    const payload = {
+      contents: [{ parts: [{ text: prompt }] }],
+      systemInstruction: { parts: [{ text: systemInstruction }] },
+    };
+    const delays = [1000, 2000, 4000, 8000, 16000];
+
+    for (let i = 0; i <= delays.length; i++) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) throw new Error(`API Error: ${response.status}`);
+        const data = await response.json();
+        return (
+          data.candidates?.[0]?.content?.parts?.[0]?.text ||
+          "The signal was lost..."
+        );
+      } catch (error) {
+        if (i === delays.length)
+          return "Connection to the Neural Net failed. Please try again later.";
+        await new Promise((resolve) => setTimeout(resolve, delays[i]));
+      }
+    }
+  };
+
+  const handleChatSubmit = async (e) => {
+    e.preventDefault();
+    if (!chatInput.trim() || isChatLoading) return;
+    const userMsg = chatInput;
+    setChatInput("");
+    setChatHistory((prev) => [...prev, { role: "user", text: userMsg }]);
+    setIsChatLoading(true);
+    const systemPrompt =
+      "You are the AI Guardian of a Cyberpunk/RPG Portfolio. Speak in a mix of technical jargon and mystical RPG metaphors. You are helpful but slightly cryptic. Keep answers concise (under 50 words).";
+    const aiResponse = await callGemini(userMsg, systemPrompt);
+    setChatHistory((prev) => [...prev, { role: "ai", text: aiResponse }]);
+    setIsChatLoading(false);
+  };
+
+  const handleSkillScan = async (skill) => {
+    setSelectedSkill(skill);
+    setSkillDescription("");
+    setIsSkillLoading(true);
+    const prompt = `Describe the technical skill "${skill}" as if it were a magical ability, weapon, or item in a fantasy RPG. Be creative but accurate to what it does. Max 1 sentence.`;
+    const description = await callGemini(prompt);
+    setSkillDescription(description);
+    setIsSkillLoading(false);
+  };
+
+  const handleDonate = async () => {
+    if (typeof window.ethereum === "undefined") {
+      alert(
+        "MetaMask is not installed! Please install it to use this feature."
+      );
+      return;
+    }
+    setIsDonating(true);
+    try {
+      const accounts = await window.ethereum.request({
+        method: "eth_requestAccounts",
+      });
+      const senderAccount = accounts[0];
+      const ethValue = parseFloat(donationAmount);
+      if (!ethValue || ethValue <= 0) {
+        alert("Please enter a valid amount.");
+        setIsDonating(false);
+        return;
+      }
+      const amountInWei = BigInt(Math.floor(ethValue * 1e18)).toString(16);
+      const transactionParameters = {
+        to: MY_WALLET_ADDRESS,
+        from: senderAccount,
+        value: "0x" + amountInWei,
+      };
+      await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [transactionParameters],
+      });
+      alert("Transaction initiated! Thank you, generous soul.");
+    } catch (error) {
+      console.error("Donation Error:", error);
+      alert("Transaction failed.");
+    } finally {
+      setIsDonating(false);
+    }
+  };
+
+  // --- NAVIGATION ---
+  const openLogs = () => {
+    setCurrentView("logs");
+    setShowModal(true);
+  };
+
+  const moveTo = (targetView) => {
+    if (npcState.isWalking) return;
+    if (currentView === targetView) {
+      if (!showModal && targetView !== "home") setShowModal(true);
+      return;
+    }
+    const locations = {
+      home: { x: 50, y: 45 },
+      bio: { x: 20, y: 60 },
+      function: { x: 80, y: 60 },
+      oracle: { x: 35, y: 85 },
+      contact: { x: 65, y: 85 },
+      treasury: { x: 80, y: 45 },
+    };
+
+    const target = locations[targetView];
+    if (!target) return;
+
+    const startX = npcState.x;
+    let facing = "front";
+    if (target.x > startX) facing = "right";
+    if (target.x < startX) facing = "left";
+    setShowModal(false);
+    setNpcState((prev) => ({ ...prev, isWalking: true, facing }));
+    setTimeout(
+      () => setNpcState({ x: target.x, y: target.y, isWalking: true, facing }),
+      50
+    );
+    setTimeout(() => {
+      setNpcState((prev) => ({ ...prev, isWalking: false, facing: "front" }));
+      setCurrentView(targetView);
+      if (targetView !== "home") setShowModal(true);
+      setSelectedSkill(null);
+    }, 1500);
+  };
+
+  const directTo = (targetView) => {
+    setCurrentView(targetView);
+    setShowModal(true);
+    setSelectedSkill(null);
+  };
+
+  const closeModal = () => {
+    setShowModal(false);
+    setSelectedSkill(null);
+    if (appMode === "Normal") setCurrentView("home");
+  };
+
+  // Re-define locations for render to include icons
+  const locationConfig = {
     home: {
       x: 50,
       y: 45,
@@ -108,180 +384,11 @@ export default function App() {
     },
     treasury: {
       x: 80,
-      y: 42,
+      y: 45,
       label: "Treasury Mine",
       icon: <Castle size={24} />,
       routeLabel: "Donate",
     },
-  };
-
-  // --- GEMINI API HELPER ---
-  const callGemini = async (prompt, systemInstruction = "") => {
-    const apiKey = ""; // Injected at runtime
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
-
-    const payload = {
-      contents: [{ parts: [{ text: prompt }] }],
-      systemInstruction: { parts: [{ text: systemInstruction }] },
-    };
-
-    const delays = [1000, 2000, 4000, 8000, 16000];
-
-    for (let i = 0; i <= delays.length; i++) {
-      try {
-        const response = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-
-        if (!response.ok) throw new Error(`API Error: ${response.status}`);
-
-        const data = await response.json();
-        return (
-          data.candidates?.[0]?.content?.parts?.[0]?.text ||
-          "The signal was lost..."
-        );
-      } catch (error) {
-        if (i === delays.length)
-          return "Connection to the Neural Net failed. Please try again later.";
-        await new Promise((resolve) => setTimeout(resolve, delays[i]));
-      }
-    }
-  };
-
-  // --- HANDLERS ---
-  const handleChatSubmit = async (e) => {
-    e.preventDefault();
-    if (!chatInput.trim() || isChatLoading) return;
-
-    const userMsg = chatInput;
-    setChatInput("");
-    setChatHistory((prev) => [...prev, { role: "user", text: userMsg }]);
-    setIsChatLoading(true);
-
-    const systemPrompt =
-      "You are the AI Guardian of a Cyberpunk/RPG Portfolio. Speak in a mix of technical jargon and mystical RPG metaphors. You are helpful but slightly cryptic. Keep answers concise (under 50 words).";
-
-    const aiResponse = await callGemini(userMsg, systemPrompt);
-
-    setChatHistory((prev) => [...prev, { role: "ai", text: aiResponse }]);
-    setIsChatLoading(false);
-  };
-
-  const handleSkillScan = async (skill) => {
-    setSelectedSkill(skill);
-    setSkillDescription("");
-    setIsSkillLoading(true);
-
-    const prompt = `Describe the technical skill "${skill}" as if it were a magical ability, weapon, or item in a fantasy RPG. Be creative but accurate to what it does. Max 1 sentence.`;
-    const description = await callGemini(prompt);
-
-    setSkillDescription(description);
-    setIsSkillLoading(false);
-  };
-
-  const handleDonate = async () => {
-    // Check if MetaMask (or another Web3 wallet) is installed
-    if (typeof window.ethereum === "undefined") {
-      alert(
-        "MetaMask is not installed! Please install it to use this feature."
-      );
-      return;
-    }
-
-    setIsDonating(true);
-
-    try {
-      // 1. Request access to the user's wallet
-      const accounts = await window.ethereum.request({
-        method: "eth_requestAccounts",
-      });
-      const senderAccount = accounts[0];
-
-      // 2. Calculate Value (ETH -> Hex Wei)
-      // 1 ETH = 10^18 Wei. We use BigInt to handle the large integer math safely.
-      const ethValue = parseFloat(donationAmount);
-      if (!ethValue || ethValue <= 0) {
-        alert("Please enter a valid amount.");
-        setIsDonating(false);
-        return;
-      }
-
-      const amountInWei = BigInt(Math.floor(ethValue * 1e18)).toString(16);
-
-      // 3. Send Transaction
-      const transactionParameters = {
-        to: MY_WALLET_ADDRESS, // Your wallet address defined at top
-        from: senderAccount, // The user's wallet address
-        value: "0x" + amountInWei, // Amount in Hex with 0x prefix
-      };
-
-      const txHash = await window.ethereum.request({
-        method: "eth_sendTransaction",
-        params: [transactionParameters],
-      });
-
-      console.log("Transaction sent:", txHash);
-      alert("Transaction initiated! Thank you, generous soul.");
-    } catch (error) {
-      console.error("Donation Error:", error);
-      // User rejected request or network error
-      if (error.code === 4001) {
-        alert("Transaction rejected.");
-      } else {
-        alert("Transaction failed. Check console for details.");
-      }
-    } finally {
-      setIsDonating(false);
-    }
-  };
-
-  // Animated navigation for RPG Mode
-  const moveTo = (targetView) => {
-    if (npcState.isWalking) return; // Ignore clicks while walking
-
-    // FIX: If already at target location, just re-open modal if it's closed
-    if (currentView === targetView) {
-      if (!showModal && targetView !== "home") {
-        setShowModal(true);
-      }
-      return;
-    }
-
-    const target = locations[targetView];
-    const startX = npcState.x;
-    let facing = "front";
-    if (target.x > startX) facing = "right";
-    if (target.x < startX) facing = "left";
-
-    setShowModal(false);
-    setNpcState((prev) => ({ ...prev, isWalking: true, facing }));
-    setTimeout(
-      () => setNpcState({ x: target.x, y: target.y, isWalking: true, facing }),
-      50
-    );
-    setTimeout(() => {
-      setNpcState((prev) => ({ ...prev, isWalking: false, facing: "front" }));
-      setCurrentView(targetView);
-      if (targetView !== "home") setShowModal(true);
-      setSelectedSkill(null);
-    }, 1500);
-  };
-
-  // Instant navigation for Standard Mode
-  const directTo = (targetView) => {
-    setCurrentView(targetView);
-    setShowModal(true);
-    setSelectedSkill(null);
-  };
-
-  const closeModal = () => {
-    setShowModal(false);
-    setSelectedSkill(null);
-    if (appMode === "Normal") {
-      setCurrentView("home");
-    }
   };
 
   return (
@@ -304,7 +411,7 @@ export default function App() {
         .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
       `}</style>
 
-      {/* --- MODE SELECTION SCREEN --- */}
+      {/* --- MODE SELECTION --- */}
       {!appMode && (
         <div className="absolute inset-0 z-[100] bg-black/95 flex flex-col items-center justify-center p-4">
           <div className="max-w-2xl w-full bg-slate-900 border-4 border-slate-700 p-10 text-center rounded-xl shadow-2xl pixel-border relative overflow-hidden">
@@ -315,7 +422,6 @@ export default function App() {
             <p className="text-slate-400 mb-10 text-lg">
               The path ahead is bifurcated. Choose your destiny.
             </p>
-
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8 relative z-10">
               <button
                 onClick={() => setAppMode("RPG")}
@@ -336,7 +442,6 @@ export default function App() {
                   </p>
                 </div>
               </button>
-
               <button
                 onClick={() => setAppMode("Normal")}
                 className="group relative p-8 bg-slate-800 border-2 border-slate-600 hover:border-blue-500 transition-all rounded-xl flex flex-col items-center gap-4 hover:scale-105 hover:bg-slate-800/80"
@@ -361,9 +466,8 @@ export default function App() {
         </div>
       )}
 
-      {/* --- Dynamic Environment --- */}
+      {/* --- ENVIRONMENT --- */}
       <div className="absolute inset-0 pointer-events-none">
-        {/* Stars */}
         <div
           className={`absolute top-0 h-[30%] w-full transition-opacity duration-1000 ${
             isNight ? "opacity-100" : "opacity-0"
@@ -383,8 +487,6 @@ export default function App() {
             ></div>
           ))}
         </div>
-
-        {/* Sun/Moon Toggle */}
         <div
           onClick={() => setIsNight(!isNight)}
           className="absolute top-10 right-10 cursor-pointer z-50 pointer-events-auto transition-transform hover:scale-110"
@@ -412,8 +514,6 @@ export default function App() {
             </div>
           )}
         </div>
-
-        {/* Horizon Trees */}
         <div className="absolute top-[25%] left-0 right-0 h-24 flex items-end justify-around opacity-80">
           {[...Array(20)].map((_, i) => (
             <div
@@ -425,8 +525,6 @@ export default function App() {
             ></div>
           ))}
         </div>
-
-        {/* Ground */}
         <div
           className={`absolute top-[30%] bottom-0 left-0 right-0 transition-colors duration-1000 ${
             isNight ? "bg-green-900" : "bg-green-500"
@@ -441,8 +539,6 @@ export default function App() {
               backgroundSize: "30px 30px",
             }}
           ></div>
-
-          {/* Scattered Trees on Grass */}
           {[...Array(12)].map((_, i) => (
             <div
               key={`tree-${i}`}
@@ -457,8 +553,6 @@ export default function App() {
               }}
             />
           ))}
-
-          {/* Normal Mode Decor */}
           {appMode === "Normal" && (
             <div className="absolute inset-0 pointer-events-none opacity-40">
               <div className="absolute top-10 left-[15%] transition-colors duration-1000 text-slate-800/50">
@@ -481,12 +575,50 @@ export default function App() {
         </div>
       </div>
 
-      {/* --- STANDARD MODE NAVIGATION --- */}
+      {/* --- NETWORK TRACE HUD (CLICKABLE ADMIN LOG) --- */}
+      {appMode && (
+        <div
+          onClick={openLogs}
+          className="absolute bottom-4 left-4 z-50 cursor-pointer group hover:scale-105 transition-transform"
+        >
+          <div className="bg-black/80 border border-green-500 group-hover:border-green-400 p-3 rounded font-mono text-[10px] text-green-400 shadow-[0_0_10px_rgba(34,197,94,0.3)] max-w-[200px]">
+            <div className="flex items-center gap-2 border-b border-green-800 pb-1 mb-2">
+              <Activity size={12} className="animate-pulse" />
+              <span className="font-bold tracking-widest">NETWORK TRACE</span>
+            </div>
+            <div className="space-y-1">
+              <div className="flex justify-between">
+                <span className="opacity-50">STATUS:</span>
+                <span className="text-green-300">CONNECTED</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="opacity-50">IP:</span>
+                <span className="text-white">
+                  {visitorData ? visitorData.ip : "SCANNING..."}
+                </span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="opacity-50">LOC:</span>
+                <span className="text-white text-right truncate">
+                  {visitorData
+                    ? `${visitorData.city}, ${visitorData.country_code}`
+                    : "..."}
+                </span>
+              </div>
+            </div>
+            <div className="mt-2 text-[8px] opacity-40 text-center animate-pulse group-hover:text-white group-hover:opacity-100">
+              // CLICK TO VIEW LOGS
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* --- STANDARD NAV --- */}
       {appMode === "Normal" && (
         <div className="absolute top-6 left-1/2 -translate-x-1/2 z-50 w-full max-w-4xl px-4 animate-in slide-in-from-top duration-500">
           <div className="bg-slate-900/90 p-3 rounded-full border-2 border-slate-600 shadow-xl backdrop-blur-md flex items-center justify-between">
             <div className="flex flex-row gap-2 overflow-x-auto scrollbar-hide w-full justify-center">
-              {Object.entries(locations).map(
+              {Object.entries(locationConfig).map(
                 ([key, loc]) =>
                   key !== "home" && (
                     <button
@@ -513,10 +645,10 @@ export default function App() {
         </div>
       )}
 
-      {/* --- RPG MODE: INTERACTIVE LOCATIONS & NPC --- */}
+      {/* --- RPG MODE: LOCATIONS & NPC --- */}
       {appMode === "RPG" && (
         <>
-          {Object.entries(locations).map(([key, loc]) => (
+          {Object.entries(locationConfig).map(([key, loc]) => (
             <div
               key={key}
               onClick={() => moveTo(key)}
@@ -545,7 +677,6 @@ export default function App() {
               </span>
             </div>
           ))}
-
           <div
             className="absolute z-20 transition-all ease-linear"
             style={{
@@ -585,7 +716,7 @@ export default function App() {
                     height="40"
                     fill="#3b82f6"
                     rx="5"
-                  />
+                  />{" "}
                   <rect
                     x="25"
                     y="10"
@@ -642,7 +773,7 @@ export default function App() {
                     rx="2"
                     className={npcState.isWalking ? "animate-pulse" : ""}
                   />
-                  <rect x="38" y="80" width="8" height="15" fill="#1e3a8a" />
+                  <rect x="38" y="80" width="8" height="15" fill="#1e3a8a" />{" "}
                   <rect x="54" y="80" width="8" height="15" fill="#1e3a8a" />
                 </g>
               </svg>
@@ -662,7 +793,7 @@ export default function App() {
         </>
       )}
 
-      {/* --- Modal Content Area --- */}
+      {/* --- MODAL --- */}
       {showModal && (
         <div className="absolute inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-300 text-white">
           <div
@@ -672,7 +803,6 @@ export default function App() {
                 : "bg-white border-emerald-600 text-slate-800"
             }`}
           >
-            {/* Close Button (Right) - Only this one remains */}
             <button
               onClick={closeModal}
               className="absolute top-4 right-4 p-2 hover:bg-red-500 hover:text-white transition-colors border border-current rounded z-10"
@@ -680,7 +810,60 @@ export default function App() {
               <X size={20} />
             </button>
 
-            {/* --- VIEW: BIO --- */}
+            {/* VIEW: LOGS (ADMIN ONLY) */}
+            {currentView === "logs" && (
+              <div className="space-y-6 h-full flex flex-col">
+                <div className="flex items-center gap-4 border-b border-green-500 pb-4">
+                  <div className="w-16 h-16 bg-black text-green-500 rounded border border-green-500 flex items-center justify-center">
+                    <Database size={32} className="animate-pulse" />
+                  </div>
+                  <div>
+                    <h2 className="text-3xl font-bold text-green-500 font-mono">
+                      SERVER LOGS
+                    </h2>
+                    <p className="opacity-70 font-mono text-xs">
+                      /var/log/visitors.log
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex-1 overflow-y-auto bg-black border border-green-900 p-4 font-mono text-xs space-y-2">
+                  {visitorLogs.length === 0 ? (
+                    <div className="text-green-800 italic">
+                      No logs found or unauthorized access...
+                    </div>
+                  ) : (
+                    visitorLogs.map((log) => (
+                      <div
+                        key={log.id}
+                        className="grid grid-cols-12 gap-2 border-b border-green-900/50 pb-2 mb-2 last:border-0 hover:bg-green-900/10 p-1"
+                      >
+                        <div className="col-span-3 text-green-400 truncate">
+                          {log.ip}
+                        </div>
+                        <div className="col-span-4 text-slate-400 truncate">
+                          {log.city}, {log.country}
+                        </div>
+                        <div className="col-span-3 text-slate-500 truncate">
+                          {log.isp}
+                        </div>
+                        <div className="col-span-2 text-right text-slate-600 text-[10px]">
+                          {log.timestamp?.seconds
+                            ? new Date(
+                                log.timestamp.seconds * 1000
+                              ).toLocaleTimeString()
+                            : "Just now"}
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+                <div className="text-[10px] text-green-800 text-center font-mono">
+                  TOTAL RECORDS: {visitorLogs.length} | ENCRYPTION: ACTIVE
+                </div>
+              </div>
+            )}
+
             {currentView === "bio" && (
               <div className="space-y-6 mt-8">
                 <div className="flex items-center gap-4 border-b border-current pb-4">
@@ -746,7 +929,6 @@ export default function App() {
               </div>
             )}
 
-            {/* --- VIEW: FUNCTIONS (Code Castle) --- */}
             {currentView === "function" && (
               <div className="space-y-6 mt-8">
                 <div className="flex items-center gap-4 border-b border-current pb-4">
@@ -762,11 +944,8 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-
-                {/* Gemini Scan Result */}
                 {selectedSkill && (
                   <div className="relative bg-purple-900/50 border border-purple-500 p-4 rounded animate-in fade-in slide-in-from-top-4">
-                    {/* Close Scan Button */}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -777,9 +956,8 @@ export default function App() {
                     >
                       <X size={16} />
                     </button>
-
                     <div className="flex items-center gap-2 text-purple-300 mb-1">
-                      <Sparkles size={16} />
+                      <Sparkles size={16} />{" "}
                       <span className="font-bold uppercase text-xs tracking-wider">
                         Scanning {selectedSkill}...
                       </span>
@@ -796,7 +974,6 @@ export default function App() {
                     )}
                   </div>
                 )}
-
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <SkillCard
                     onScan={handleSkillScan}
@@ -845,7 +1022,6 @@ export default function App() {
               </div>
             )}
 
-            {/* --- VIEW: ORACLE (AI Nexus) --- */}
             {currentView === "oracle" && (
               <div className="h-[60vh] flex flex-col mt-8">
                 <div className="flex items-center gap-4 border-b border-current pb-4 mb-4">
@@ -861,8 +1037,6 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-
-                {/* Chat Window */}
                 <div
                   className={`flex-1 overflow-y-auto p-4 rounded mb-4 border font-mono text-sm space-y-3 ${
                     isNight
@@ -918,8 +1092,6 @@ export default function App() {
                   )}
                   <div ref={chatEndRef} />
                 </div>
-
-                {/* Input Area */}
                 <form onSubmit={handleChatSubmit} className="flex gap-2">
                   <input
                     type="text"
@@ -943,7 +1115,6 @@ export default function App() {
               </div>
             )}
 
-            {/* --- VIEW: TREASURY (Crypto Mine) --- */}
             {currentView === "treasury" && (
               <div className="space-y-6 mt-8 text-center">
                 <div className="flex flex-col items-center gap-4 border-b border-current pb-6">
@@ -959,7 +1130,6 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-
                 <div
                   className={`p-6 rounded-xl border-2 ${
                     isNight
@@ -986,7 +1156,6 @@ export default function App() {
                       />
                     </div>
                   </div>
-
                   <button
                     onClick={handleDonate}
                     disabled={isDonating}
@@ -1003,7 +1172,6 @@ export default function App() {
                     )}
                     {isDonating ? "Processing..." : "Donate"}
                   </button>
-
                   <p className="mt-4 text-xs opacity-50">
                     *Requires a browser with a Web3 wallet extension like
                     MetaMask.
@@ -1012,7 +1180,6 @@ export default function App() {
               </div>
             )}
 
-            {/* --- VIEW: CONTACT --- */}
             {currentView === "contact" && (
               <div className="space-y-6 text-center mt-8">
                 <div className="border-b border-current pb-4">
