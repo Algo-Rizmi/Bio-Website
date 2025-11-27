@@ -26,17 +26,11 @@ import {
   Wallet,
   Activity,
   Database,
-  Lock,
 } from "lucide-react";
 
 // --- FIREBASE IMPORTS ---
 import { initializeApp } from "firebase/app";
-import {
-  getAuth,
-  signInAnonymously,
-  onAuthStateChanged,
-  signInWithCustomToken,
-} from "firebase/auth";
+import { getAuth, signInAnonymously, onAuthStateChanged } from "firebase/auth";
 import {
   getFirestore,
   collection,
@@ -47,38 +41,46 @@ import {
   serverTimestamp,
 } from "firebase/firestore";
 
+// --- PASTE YOUR FIREBASE CONFIG HERE LATER ---
+// For now, we leave it null so the app doesn't crash!
+const firebaseConfig = null;
+// Example format:
+// const firebaseConfig = {
+//   apiKey: "AIzaSy...",
+//   authDomain: "...",
+//   projectId: "...",
+//   storageBucket: "...",
+//   messagingSenderId: "...",
+//   appId: "..."
+// };
+
 export default function App() {
-  // --- CONFIGURATION ---
   const MY_WALLET_ADDRESS = "0x71C7656EC7ab88b098defB751B7401B5f6d8976F";
 
-  // --- FIREBASE SETUP ---
+  // --- FIREBASE STATE ---
   const [user, setUser] = useState(null);
   const [db, setDb] = useState(null);
-  const [appId, setAppId] = useState(null);
-  const hasLoggedVisit = useRef(false); // Prevent double logging in Strict Mode
+  const hasLoggedVisit = useRef(false);
 
+  // --- INIT FIREBASE SAFELY ---
   useEffect(() => {
-    // 1. Initialize Firebase
-    const firebaseConfig = JSON.parse(__firebase_config);
-    const app = initializeApp(firebaseConfig);
-    const auth = getAuth(app);
-    const firestore = getFirestore(app);
+    if (!firebaseConfig) {
+      console.log("Firebase config missing. Logs disabled.");
+      return;
+    }
 
-    setDb(firestore);
-    setAppId(typeof __app_id !== "undefined" ? __app_id : "default-app-id");
+    try {
+      const app = initializeApp(firebaseConfig);
+      const auth = getAuth(app);
+      const firestore = getFirestore(app);
+      setDb(firestore);
 
-    // 2. Authenticate
-    const initAuth = async () => {
-      if (typeof __initial_auth_token !== "undefined" && __initial_auth_token) {
-        await signInWithCustomToken(auth, __initial_auth_token);
-      } else {
-        await signInAnonymously(auth);
-      }
-    };
-    initAuth();
-
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
+      signInAnonymously(auth).catch((err) => console.error("Auth Error:", err));
+      const unsubscribe = onAuthStateChanged(auth, setUser);
+      return () => unsubscribe();
+    } catch (error) {
+      console.error("Firebase Init Error:", error);
+    }
   }, []);
 
   // --- STATE ---
@@ -93,7 +95,7 @@ export default function App() {
   });
   const [showModal, setShowModal] = useState(false);
   const [visitorData, setVisitorData] = useState(null);
-  const [visitorLogs, setVisitorLogs] = useState([]); // Store fetched logs
+  const [visitorLogs, setVisitorLogs] = useState([]);
 
   // Gemini & Chat
   const [chatInput, setChatInput] = useState("");
@@ -117,44 +119,27 @@ export default function App() {
   const chatEndRef = useRef(null);
 
   // --- EFFECTS ---
-
-  // Scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatHistory]);
 
-  // Fetch Visitor IP & Log to Firebase
+  // Fetch Visitor IP & Log (Only if DB is ready)
   useEffect(() => {
     const logVisitor = async () => {
-      if (!user || !db || hasLoggedVisit.current) return;
-
       try {
         const response = await fetch("https://ipapi.co/json/");
         const data = await response.json();
         setVisitorData(data);
 
-        // Log to Firebase
-        if (data.ip) {
-          hasLoggedVisit.current = true; // Mark as logged
-          await addDoc(
-            collection(
-              db,
-              "artifacts",
-              appId,
-              "public",
-              "data",
-              "visitor_logs"
-            ),
-            {
-              ip: data.ip,
-              city: data.city || "Unknown",
-              country: data.country_name || "Unknown",
-              isp: data.org || "Unknown",
-              timestamp: serverTimestamp(),
-              platform: navigator.platform,
-            }
-          );
-          console.log("Visitor logged securely.");
+        if (db && user && !hasLoggedVisit.current) {
+          hasLoggedVisit.current = true;
+          await addDoc(collection(db, "visitor_logs"), {
+            ip: data.ip || "Unknown",
+            city: data.city || "Unknown",
+            country: data.country_name || "Unknown",
+            isp: data.org || "Unknown",
+            timestamp: serverTimestamp(),
+          });
         }
       } catch (error) {
         console.error("Tracking failed:", error);
@@ -165,38 +150,29 @@ export default function App() {
         });
       }
     };
-
     logVisitor();
-  }, [user, db, appId]);
+  }, [user, db]);
 
-  // Fetch Logs for Admin View
+  // Fetch Logs (Only if DB is ready)
   useEffect(() => {
     if (!user || !db || currentView !== "logs") return;
 
-    // Real-time listener for logs
     const q = query(
-      collection(db, "artifacts", appId, "public", "data", "visitor_logs")
+      collection(db, "visitor_logs"),
+      orderBy("timestamp", "desc")
     );
     const unsubscribe = onSnapshot(
       q,
       (snapshot) => {
-        const logs = snapshot.docs.map((doc) => ({
-          id: doc.id,
-          ...doc.data(),
-        }));
-        // Sort in memory since simple queries are required
-        logs.sort(
-          (a, b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0)
+        setVisitorLogs(
+          snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }))
         );
-        setVisitorLogs(logs);
       },
-      (error) => {
-        console.error("Error fetching logs:", error);
-      }
+      (error) => console.error("Log fetch error:", error)
     );
 
     return () => unsubscribe();
-  }, [user, db, currentView, appId]);
+  }, [user, db, currentView]);
 
   // --- HELPERS ---
   const callGemini = async (prompt, systemInstruction = "") => {
@@ -291,7 +267,6 @@ export default function App() {
     }
   };
 
-  // --- NAVIGATION ---
   const openLogs = () => {
     setCurrentView("logs");
     setShowModal(true);
@@ -303,16 +278,7 @@ export default function App() {
       if (!showModal && targetView !== "home") setShowModal(true);
       return;
     }
-    const locations = {
-      home: { x: 50, y: 45 },
-      bio: { x: 20, y: 60 },
-      function: { x: 80, y: 60 },
-      oracle: { x: 35, y: 85 },
-      contact: { x: 65, y: 85 },
-      treasury: { x: 80, y: 45 },
-    };
-
-    const target = locations[targetView];
+    const target = locationConfig[targetView];
     if (!target) return;
 
     const startX = npcState.x;
@@ -345,7 +311,6 @@ export default function App() {
     if (appMode === "Normal") setCurrentView("home");
   };
 
-  // Re-define locations for render to include icons
   const locationConfig = {
     home: {
       x: 50,
@@ -411,7 +376,6 @@ export default function App() {
         .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
       `}</style>
 
-      {/* --- MODE SELECTION --- */}
       {!appMode && (
         <div className="absolute inset-0 z-[100] bg-black/95 flex flex-col items-center justify-center p-4">
           <div className="max-w-2xl w-full bg-slate-900 border-4 border-slate-700 p-10 text-center rounded-xl shadow-2xl pixel-border relative overflow-hidden">
@@ -466,7 +430,6 @@ export default function App() {
         </div>
       )}
 
-      {/* --- ENVIRONMENT --- */}
       <div className="absolute inset-0 pointer-events-none">
         <div
           className={`absolute top-0 h-[30%] w-full transition-opacity duration-1000 ${
@@ -575,7 +538,7 @@ export default function App() {
         </div>
       </div>
 
-      {/* --- NETWORK TRACE HUD (CLICKABLE ADMIN LOG) --- */}
+      {/* --- NETWORK TRACE HUD (ADMIN) --- */}
       {appMode && (
         <div
           onClick={openLogs}
@@ -645,7 +608,7 @@ export default function App() {
         </div>
       )}
 
-      {/* --- RPG MODE: LOCATIONS & NPC --- */}
+      {/* --- RPG MODE --- */}
       {appMode === "RPG" && (
         <>
           {Object.entries(locationConfig).map(([key, loc]) => (
@@ -810,12 +773,12 @@ export default function App() {
               <X size={20} />
             </button>
 
-            {/* VIEW: LOGS (ADMIN ONLY) */}
+            {/* LOGS VIEW (SAFE MODE) */}
             {currentView === "logs" && (
               <div className="space-y-6 h-full flex flex-col">
                 <div className="flex items-center gap-4 border-b border-green-500 pb-4">
                   <div className="w-16 h-16 bg-black text-green-500 rounded border border-green-500 flex items-center justify-center">
-                    <Database size={32} className="animate-pulse" />
+                    <Database size={32} />
                   </div>
                   <div>
                     <h2 className="text-3xl font-bold text-green-500 font-mono">
@@ -826,40 +789,10 @@ export default function App() {
                     </p>
                   </div>
                 </div>
-
-                <div className="flex-1 overflow-y-auto bg-black border border-green-900 p-4 font-mono text-xs space-y-2">
-                  {visitorLogs.length === 0 ? (
-                    <div className="text-green-800 italic">
-                      No logs found or unauthorized access...
-                    </div>
-                  ) : (
-                    visitorLogs.map((log) => (
-                      <div
-                        key={log.id}
-                        className="grid grid-cols-12 gap-2 border-b border-green-900/50 pb-2 mb-2 last:border-0 hover:bg-green-900/10 p-1"
-                      >
-                        <div className="col-span-3 text-green-400 truncate">
-                          {log.ip}
-                        </div>
-                        <div className="col-span-4 text-slate-400 truncate">
-                          {log.city}, {log.country}
-                        </div>
-                        <div className="col-span-3 text-slate-500 truncate">
-                          {log.isp}
-                        </div>
-                        <div className="col-span-2 text-right text-slate-600 text-[10px]">
-                          {log.timestamp?.seconds
-                            ? new Date(
-                                log.timestamp.seconds * 1000
-                              ).toLocaleTimeString()
-                            : "Just now"}
-                        </div>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <div className="text-[10px] text-green-800 text-center font-mono">
-                  TOTAL RECORDS: {visitorLogs.length} | ENCRYPTION: ACTIVE
+                <div className="flex-1 overflow-y-auto bg-black border border-green-900 p-4 font-mono text-xs space-y-2 text-green-800 italic">
+                  {firebaseConfig
+                    ? "Loading logs..."
+                    : "DATABASE DISCONNECTED. PLEASE CONFIGURE FIREBASE."}
                 </div>
               </div>
             )}
